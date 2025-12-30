@@ -1,63 +1,103 @@
+# ========================= main.py =========================
 import torch
-import torch.nn as nn
 import numpy as np
 import time
 from lgcn.lgcnModel import LGCN
 
-def assign_nodes_to_drivers(nodes, num_drivers, driver_starts, dist_mat):
-    assignments = {i: [] for i in range(num_drivers)}
 
-    for i in range(len(nodes)):
-        dists = [dist_mat[i, start] for start in driver_starts]
-        driver = np.argmin(dists)
-        assignments[driver].append(i)
-
-    return assignments
-
-def distance_matrix(points, points2):
-    return np.sqrt(((points[:, np.newaxis] - points2[np.newaxis, :]) ** 2).sum(axis=2))
-
-def run_routing_simulation(nodes, num_drivers, driver_starts, lgcn):   # TODO make it lgcn
+def distance_matrix(points):
+    return np.sqrt(((points[:, None] - points[None, :]) ** 2).sum(axis=2))
 
 
-    while True:   #TODO callback - by event not busy wait
+def run_routing_simulation(nodes, num_drivers, driver_starts, lgcn):
+    torch.manual_seed(0)
 
-        dist_mat = distance_matrix(nodes, nodes)
-        assignments = assign_nodes_to_drivers(nodes,num_drivers, driver_starts, dist_mat)
-        print("Assignments:", assignments)
+    while True:
+        print("\n================ NEW STEP ================")
 
+        # -------- Build distance matrix --------
+        dist_mat = distance_matrix(nodes)
+
+        # -------- Node features --------
         node_features = torch.tensor(nodes, dtype=torch.float32)
-        subroute_caps = lgcn(node_features)
-        print("Subroute Capsules:", subroute_caps)
 
+        # -------- Node capsules --------
+        node_caps = lgcn.node_fc(node_features)  # [N, node_caps_dim]
+        node_caps = node_caps / (
+            torch.norm(node_caps, dim=-1, keepdim=True) + 1e-8
+        )
+
+        # -------- Sub-route capsules --------
+        subroute_caps = lgcn.routing(node_caps)  # [num_drivers, subroute_caps_dim]
+
+        # -------- Projection: u_hat_ij --------
+        # maps node capsules -> sub-route capsule space
+        proj = torch.nn.Linear(
+            node_caps.size(1),
+            subroute_caps.size(1),
+            bias=False
+        )
+
+        u_hat = proj(node_caps)  # [N, subroute_caps_dim]
+
+        # -------- Capsule agreement --------
+        # agreement(i, j) = u_hat_i · v_j
+        sim = torch.matmul(u_hat, subroute_caps.T)  # [N, num_drivers]
+
+        # -------- Assign nodes to drivers --------
+        assignments = {d: [] for d in range(num_drivers)}
+
+        for i in range(len(nodes)):
+            if i in driver_starts:
+                continue
+            driver = torch.argmax(sim[i]).item()
+            assignments[driver].append(i)
+
+        print("Assignments (capsule-based):", assignments)
+
+        # -------- Build routes (capsule-guided greedy) --------
         driver_routes = {}
-        for driver, node_ids in assignments.items():
-            route = [driver_starts[driver]]
-            visited = set(route)
-            remaining_nodes = set(node_ids)
-            while remaining_nodes:
-                last_node = route[-1]
-                candidates = [n for n in remaining_nodes if n not in visited]
-                if not candidates:
-                    break
-                next_node = min(candidates, key=lambda n: dist_mat[last_node, n])
-                route.append(next_node)
-                visited.add(next_node)
-                remaining_nodes.remove(next_node)
-            route.append(driver_starts[driver])
-            driver_routes[driver] = route
 
-        print("\nDriver Routes (final, no repeats):")
-        for driver, route in driver_routes.items():
-            print(f"Driver {driver} route: {route}")
-  
-        new_point = nodes[-1] + np.random.uniform(-0.001, 0.001, size=2)    #TODO get a new stop from?
+        for d in range(num_drivers):
+            route = [driver_starts[d]]
+            remaining = set(assignments[d])
+
+            while remaining:
+                last = route[-1]
+
+                # score combines capsule agreement + locality
+                best_score = -1e9
+                best_node = None
+
+                for n in remaining:
+                    score = (
+                        sim[n, d].item()
+                        - 0.01 * dist_mat[last, n]
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_node = n
+
+                route.append(best_node)
+                remaining.remove(best_node)
+
+            route.append(driver_starts[d])
+            driver_routes[d] = route
+
+        print("\nDriver Routes (LGCN-guided):")
+        for d, r in driver_routes.items():
+            print(f"Driver {d}: {r}")
+
+        # -------- Dynamic event (new node arrives) --------
+        new_point = nodes[-1] + np.random.uniform(-0.001, 0.001, size=2)
         nodes = np.vstack([nodes, new_point])
-        print("\nAdded new point:", new_point)
+
+        print("\nAdded new node:", new_point)
 
         time.sleep(2)
 
 
+# ========================= INIT =========================
 nodes = np.array([
     [32.0853, 34.7818],  # depot 0
     [32.0860, 34.7800],  # depot 1
@@ -71,6 +111,12 @@ nodes = np.array([
 num_drivers = 2
 driver_starts = [0, 1]
 
-lgcn = LGCN(node_input_dim=2, node_caps_dim=8, subroute_caps_dim=2, num_subroutes=num_drivers)
+lgcn = LGCN(
+    node_input_dim=2,
+    node_caps_dim=8,
+    subroute_caps_dim=4,
+    num_subroutes=num_drivers
+)
 
 run_routing_simulation(nodes, num_drivers, driver_starts, lgcn)
+# TODO : Add: time windows in main input, start and end stations and imp callback
