@@ -1,6 +1,6 @@
 class Node:
     def __init__(self, node_id, x, y, demand=0, time_window=None, wait=0):
-        self.id = node_id
+        self.id = node_id  
         self.x = x
         self.y = y
         self.demand = demand
@@ -8,4 +8,4 @@ class Node:
         self.wait = wait
 
     def features(self):
-        return [self.x, self.y, self.demand, self.wait]
+        return [self.x, self.y, self.demand, self.wait] # TODO time window?
