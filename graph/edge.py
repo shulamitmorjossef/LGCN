@@ -2,11 +2,9 @@ import math
 
 class Edge:
     def __init__(self, i, j, traffic=1.0, urgency=1.0):
-        self.i = i
-        self.j = j #TODO  why dont dist
+        self.dist = math.dist((i.x, i.y), (j.x, j.y))
         self.traffic = traffic
         self.urgency = urgency
 
     def weight(self):
-        dist = math.dist((self.i.x, self.i.y), (self.j.x, self.j.y))
-        return dist * self.traffic + self.urgency   #TODO  return dist * (self.traffic + self.urgency
+        return self.dist * (self.traffic + self.urgency)  

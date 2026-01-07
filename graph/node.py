@@ -13,7 +13,7 @@ class Node:
         tw_flat = []
         for tw in self.time_windows[:max_windows]:
             tw_flat.extend([tw[0], tw[1]])
-        # Pad if needed
+        
         while len(tw_flat) < 2 * max_windows:
             tw_flat.append(0)
         return [self.x, self.y, self.demand, self.wait] + tw_flat
