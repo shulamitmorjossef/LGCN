@@ -66,7 +66,7 @@ def optimize_route(points):
         route_indices.append(best_next)
         visited[best_next] = True
 
-    return points[route_indices].tolist()
+    return route_indices
 
 
 if __name__ == "__main__":
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         [32.0870, 34.7820],
     ]
 
-    optimal_route = optimize_route(sample_points)
-    print("Optimal route:")
-    for i, point in enumerate(optimal_route):
-        print(f"  Stop {i + 1}: {point}")
+    optimal_indices = optimize_route(sample_points)
+    print("Optimal route indices:", optimal_indices)
+    for rank, idx in enumerate(optimal_indices):
+        print(f"  Stop {rank + 1}: {sample_points[idx]}")
