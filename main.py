@@ -4,6 +4,7 @@ import numpy as np
 import time
 from lgcn.lgcnModel import LGCN
 
+
 def assign_nodes_to_drivers(nodes, num_drivers, driver_starts, dist_mat):
     assignments = {i: [] for i in range(num_drivers)}
 
