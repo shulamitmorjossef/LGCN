@@ -5,9 +5,18 @@ import time
 from lgcn.lgcnModel import LGCN
 
 
-def distance_matrix(points):
-    return np.sqrt(((points[:, None] - points[None, :]) ** 2).sum(axis=2))
+def assign_nodes_to_drivers(nodes, num_drivers, driver_starts, dist_mat):
+    assignments = {i: [] for i in range(num_drivers)}
 
+    for i in range(len(nodes)):
+        dists = [dist_mat[i, start] for start in driver_starts]
+        driver = np.argmin(dists)
+        assignments[driver].append(i)
+
+    return assignments
+
+def distance_matrix(points, points2):
+    return np.sqrt(((points[:, np.newaxis] - points2[np.newaxis, :]) ** 2).sum(axis=2))
 
 def run_routing_simulation(nodes, num_drivers, driver_starts, lgcn):
     torch.manual_seed(0)
