@@ -1,5 +1,6 @@
-import torch
 import torch.nn as nn
+from lgcn.capsule import squash
+from lgcn.routing import dynamic_routing
 
 class RoutingLayer(nn.Module):
     """
@@ -32,10 +33,9 @@ class RoutingLayer(nn.Module):
         Returns:
             torch.Tensor: Subroute capsules of shape (num_subroutes, subroute_caps_dim).
         """
-        out = self.transform(x)
-        out = out.view(x.size(0), self.num_subroutes, self.subroute_caps_dim)
-        out = out / (torch.norm(out, dim=-1, keepdim=True) + 1e-8)
-        subroute_caps = out.sum(dim=0)
+        u_hat = self.transform(x)
+        u_hat = u_hat.view(x.size(0), self.num_subroutes, self.subroute_caps_dim)
+        subroute_caps = dynamic_routing(u_hat)
         return subroute_caps
 
 class LGCN(nn.Module):
@@ -45,7 +45,7 @@ class LGCN(nn.Module):
     This model processes node features to generate subroute capsules for routing problems,
     such as vehicle routing with multiple drivers.
     """
-    def __init__(self, node_input_dim, node_caps_dim, subroute_caps_dim, num_subroutes):
+    def __init__(self, node_input_dim, node_caps_dim, subroute_caps_dim, num_subroutes, full_route_caps_dim):
         """
         Initialize the LGCN model.
 
@@ -54,10 +54,12 @@ class LGCN(nn.Module):
             node_caps_dim (int): Dimensionality of node capsules after first linear layer.
             subroute_caps_dim (int): Dimensionality of subroute capsules.
             num_subroutes (int): Number of subroutes (e.g., number of drivers).
+            full_route_caps_dim (int): Dimensionality of the full route capsule.
         """
         super().__init__()
         self.node_fc = nn.Linear(node_input_dim, node_caps_dim)
         self.routing = RoutingLayer(node_caps_dim, num_subroutes, subroute_caps_dim)
+        self.full_route_routing = RoutingLayer(subroute_caps_dim, 1, full_route_caps_dim)
 
     def forward(self, node_features):
         """
@@ -67,9 +69,12 @@ class LGCN(nn.Module):
             node_features (torch.Tensor): Input node features of shape (num_nodes, node_input_dim).
 
         Returns:
-            torch.Tensor: Subroute capsules of shape (num_subroutes, subroute_caps_dim).
+            tuple: (subroute_caps, full_route_caps)
+                - subroute_caps: shape (num_subroutes, subroute_caps_dim)
+                - full_route_caps: shape (1, full_route_caps_dim)
         """
         node_caps = self.node_fc(node_features)
-        node_caps = node_caps / (torch.norm(node_caps, dim=-1, keepdim=True) + 1e-8)
+        node_caps = squash(node_caps)
         subroute_caps = self.routing(node_caps)
-        return subroute_caps
+        full_route_caps = self.full_route_routing(subroute_caps)
+        return subroute_caps, full_route_caps
