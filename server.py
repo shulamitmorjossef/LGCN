@@ -15,18 +15,21 @@ app.add_middleware(
 
 
 class RouteRequest(BaseModel):
-    driver_id: str
+    driver_id: Optional[str] = None
     nodes: List[List[float]]
     traffic_delays: Optional[List[List[float]]] = None
+    traffic_matrix: Optional[List[List[float]]] = None  # alias sent by Flutter client
     priorities: Optional[List[float]] = None
 
 
 @app.post("/compute-routes")
 def compute_routes(request: RouteRequest):
+    driver_id = request.driver_id or "default_driver"
+    traffic = request.traffic_delays or request.traffic_matrix
     route_node_ids = optimize_route(
-        driver_id=request.driver_id,
+        driver_id=driver_id,
         new_points=request.nodes,
-        traffic_delays=request.traffic_delays,
+        traffic_delays=traffic,
         priorities=request.priorities,
     )
     return {"status": "success", "routes": {"0": route_node_ids}}
