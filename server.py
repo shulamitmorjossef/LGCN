@@ -15,6 +15,7 @@ app.add_middleware(
 
 
 class RouteRequest(BaseModel):
+    driver_id: str
     nodes: List[List[float]]
     traffic_delays: Optional[List[List[float]]] = None
     priorities: Optional[List[float]] = None
@@ -22,12 +23,20 @@ class RouteRequest(BaseModel):
 
 @app.post("/compute-routes")
 def compute_routes(request: RouteRequest):
-    route_indices = optimize_route(
-        request.nodes,
+    route_node_ids = optimize_route(
+        driver_id=request.driver_id,
+        new_points=request.nodes,
         traffic_delays=request.traffic_delays,
         priorities=request.priorities,
     )
-    return {"status": "success", "routes": {"0": route_indices}}
+    return {"status": "success", "routes": {"0": route_node_ids}}
+
+
+@app.delete("/driver/{driver_id}")
+def delete_driver(driver_id: str):
+    from main import reset_driver
+    reset_driver(driver_id)
+    return {"status": "success", "driver_id": driver_id}
 
 
 if __name__ == "__main__":
