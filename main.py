@@ -87,7 +87,6 @@ _W4 = np.array([
 
 # ── Singleton model (weights persisted to disk) ───────────────────────────────
 
-_MODEL_PATH = os.path.join(os.path.dirname(__file__), "lgcn_weights.pt")
 _NODE_CAPS_DIM = 8
 _SUBROUTE_CAPS_DIM = 4
 _FULL_ROUTE_CAPS_DIM = 4
@@ -101,12 +100,14 @@ def _load_or_init_model():
         full_route_caps_dim=_FULL_ROUTE_CAPS_DIM,
     )
     proj = torch.nn.Linear(_NODE_CAPS_DIM, _FULL_ROUTE_CAPS_DIM, bias=False)
-    if os.path.exists(_MODEL_PATH):
-        checkpoint = torch.load(_MODEL_PATH, weights_only=True)
-        lgcn.load_state_dict(checkpoint["lgcn"])
-        proj.load_state_dict(checkpoint["proj"])
-    else:
-        torch.save({"lgcn": lgcn.state_dict(), "proj": proj.state_dict()}, _MODEL_PATH)
+    with torch.no_grad():
+        lgcn.node_fc.weight.copy_(torch.tensor(_W1, dtype=torch.float32))
+        lgcn.node_fc.bias.zero_()
+        lgcn.routing.transform.weight.copy_(torch.tensor(_W2, dtype=torch.float32))
+        lgcn.routing.transform.bias.zero_()
+        lgcn.full_route_routing.transform.weight.copy_(torch.tensor(_W3, dtype=torch.float32))
+        lgcn.full_route_routing.transform.bias.zero_()
+        proj.weight.copy_(torch.tensor(_W4, dtype=torch.float32))
     lgcn.eval()
     proj.eval()
     return lgcn, proj
