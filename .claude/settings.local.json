@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(.venv/Scripts/python.exe main.py)"
+      "Bash(.venv/Scripts/python.exe main.py)",
+      "Bash(python main.py)"
     ]
   }
 }
