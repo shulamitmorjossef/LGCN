@@ -212,55 +212,69 @@ def _point_to_node(node_id, pt) -> Node:
     return Node(node_id=node_id, x=pt[0], y=pt[1], time_windows=tw, wait=wait)
 
 
-# Sentinel id for the driver's current location: it is never written to the
-# driver's cache (real cached stop ids are always >= 0), so it can't collide.
+# Sentinel ids for the driver's current location / mandatory end point: they
+# are never written to the driver's cache (real cached stop ids are always
+# >= 0), so they can't collide with a real stop id.
 _CURRENT_LOCATION_ID = -1
+_END_LOCATION_ID = -2
+
+# How strongly the route construction "leans" toward the mandatory end point
+# while still choosing intermediate stops, so the path doesn't strand a far
+# stop for last. Ramps from 0.5x to 1x of this value as the route progresses
+# (see optimize_route). Tune if routes feel too end-biased / not enough.
+_END_PULL_BASE_WEIGHT = 0.3
 
 
 # ── Main routing function ─────────────────────────────────────────────────────
 
-def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=None):
+def optimize_route(driver_id: str, current_location, stops, end_point=None,
+                    traffic_delays=None, priorities=None):
     """
     Incrementally update a driver's graph and return the optimal route over
     all their current stops.
 
-    By convention, `new_points[0]` is always the driver's CURRENT LOCATION,
-    not a stop: it's only used as the route's starting point for this call
-    and is never written to the driver's cache. GPS readings for "the same"
-    physical spot jitter by a few meters between requests, so caching it
-    would create a new spurious stop on every refresh. `new_points[1:]` are
-    the actual stops — each one is checked against the driver's cached
-    stops by coordinates: if it already exists it is NOT added again (no
-    duplicate node), but it is still taken into account when computing the
-    route. Only genuinely new stops are added to the cache.
+    `current_location` and `end_point` are structural endpoints, not stops:
+    they are never written to the driver's cache (GPS readings jitter by a
+    few meters between requests, so caching them would create spurious
+    duplicate stops on every refresh). They're rebuilt fresh on every call
+    from whatever you pass in.
+
+    `stops` are the actual stops to visit — each one is checked against the
+    driver's cached stops by coordinates: if it already exists it is NOT
+    added again (no duplicate node), but it is still taken into account when
+    computing the route. Only genuinely new stops are added to the cache.
 
     Args:
-        driver_id:      Unique identifier for the driver.
-        new_points:     [current_location, *stops], each as
-                        [x, y, tw_start, tw_end, wait]. Pass all stops on
-                        the first call; on later calls you may pass the
-                        full current set again — stops that already exist
-                        for this driver are recognized and skipped, only
-                        genuinely new ones get cached. The current location
-                        (index 0) is refreshed every call regardless.
-        traffic_delays: Optional N×N matrix (for the points in `new_points`,
-                        relative to each other, in that order).
-        priorities:     Optional priority per point in `new_points` (same
-                        order/length as `new_points`).
+        driver_id:        Unique identifier for the driver.
+        current_location: [x, y, tw_start, tw_end, wait] — the driver's
+                           position right now. Always first in the route.
+        stops:             List of stops as [x, y, tw_start, tw_end, wait].
+                           Pass all stops on the first call; on later calls
+                           you may pass the full current set again — stops
+                           that already exist for this driver are recognized
+                           and skipped, only genuinely new ones get cached.
+        end_point:         Optional [x, y, tw_start, tw_end, wait] — a
+                           mandatory final destination. If given, it is
+                           always last in the route, regardless of its
+                           capsule-similarity score; intermediate stops are
+                           still chosen with a "pull" toward it so the route
+                           doesn't strand a far stop for the very last leg.
+                           If omitted, the route ends wherever the greedy
+                           construction naturally finishes (today's
+                           behavior).
+        traffic_delays:    Optional N×N matrix for `stops` only, relative to
+                           each other, in that order.
+        priorities:        Optional priority per stop in `stops` (same
+                           order/length as `stops`).
 
     Returns:
-        list: Ordered node-id values representing the optimal route over the
-              current location and ALL current stops for this driver. The
-              current location is reported with id `-1` since it isn't a
-              cached node.
+        list: Ordered node-id values representing the optimal route:
+              current_location (id -1) → cached stops → end_point (id -2,
+              if given). The endpoints use negative sentinel ids since they
+              aren't cached nodes.
     """
-    if not new_points:
-        raise ValueError("new_points must include at least the current location")
-
-    current_pt, stop_points = new_points[0], new_points[1:]
-
     # Load existing graph state for this driver (cached STOPS only — the
-    # current location is never persisted here).
+    # current location / end point are never persisted here).
     graph = load_driver_graph(driver_id)
     existing_ids = list(graph.nodes.keys())
     next_id = max(existing_ids, default=-1) + 1
@@ -268,11 +282,10 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
     # For each incoming stop, resolve it to a node id: reuse the existing
     # node if this stop is already cached for the driver, otherwise create
     # and cache a new node. `request_node_ids` keeps the same order/length
-    # as `new_points` (index 0 = current location sentinel) so
-    # traffic_delays/priorities can be mapped back.
-    request_node_ids = [_CURRENT_LOCATION_ID]
+    # as `stops` so traffic_delays/priorities can be mapped back.
+    request_node_ids = []
     graph_changed = False
-    for pt in stop_points:
+    for pt in stops:
         match = _find_matching_node(graph, pt[0], pt[1])
         if match is not None:
             request_node_ids.append(match.id)
@@ -287,22 +300,27 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
     if graph_changed:
         save_driver_graph(driver_id, graph)
 
-    # Current location is transient: built fresh every call, used as the
-    # route's starting point, but never added to `graph`/the cache.
-    current_node = _point_to_node(_CURRENT_LOCATION_ID, current_pt)
-    all_nodes = [current_node] + list(graph.nodes.values())
+    # current_location / end_point are transient: built fresh every call,
+    # used as the route's fixed endpoints, but never added to the cache.
+    current_node = _point_to_node(_CURRENT_LOCATION_ID, current_location)
+    end_node = _point_to_node(_END_LOCATION_ID, end_point) if end_point is not None else None
+
+    all_nodes = [current_node] + list(graph.nodes.values()) + ([end_node] if end_node else [])
     n = len(all_nodes)
 
     if n <= 1:
         return [node.id for node in all_nodes]
 
     id_to_pos = {node.id: idx for idx, node in enumerate(all_nodes)}
+    end_pos = id_to_pos[_END_LOCATION_ID] if end_node else None
 
     # Build model input features for all current nodes
     points_arr = np.array([_node_to_model_input(node) for node in all_nodes], dtype=np.float32)
     node_features = torch.tensor(points_arr, dtype=torch.float32)
 
-    # LGCN inference: capsule similarity scores per node
+    # LGCN inference: capsule similarity scores per node (unaffected by the
+    # fixed-endpoint logic below — it just scores every node, including the
+    # endpoints, exactly as before).
     with torch.no_grad():
         node_caps = _lgcn.node_fc(node_features)
         node_caps = squash(node_caps)
@@ -314,7 +332,7 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
     dist_mat = _distance_matrix(points_arr[:, :2])
 
     # Build traffic/priority arrays aligned to current node order.
-    # `request_node_ids[local_i]` is the node id that `new_points[local_i]`
+    # `request_node_ids[local_i]` is the node id that `stops[local_i]`
     # resolved to (a new node, or a pre-existing/duplicate one) — used to
     # map the request-ordered priorities/traffic_delays onto graph positions.
     pri = np.ones(n, dtype=np.float64)
@@ -339,13 +357,26 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
                 if pos_b is not None:
                     delay_mat[pos_a, pos_b] = td[a, b]
 
-    # Greedy route construction (score = capsule similarity − edge cost)
+    # Greedy route construction (score = capsule similarity − edge cost).
+    # current_node is always first (position 0); end_node, if given, is
+    # excluded from competition and forced last — but every intermediate
+    # choice is nudged ("pulled") toward it so the route doesn't strand a
+    # far-away stop for the final leg. The pull strength ramps up as fewer
+    # stops remain, since stranding risk grows the closer we get to the end.
     visited = [False] * n
     route = [0]
     visited[0] = True
+    if end_pos is not None:
+        visited[end_pos] = True  # taken out of the running; appended at the end
 
-    for _ in range(n - 1):
+    remaining = n - 1 - (1 if end_pos is not None else 0)
+    for step in range(remaining):
         last = route[-1]
+        end_weight = 0.0
+        if end_pos is not None:
+            progress = step / remaining if remaining else 0.0
+            end_weight = _END_PULL_BASE_WEIGHT * (0.5 + 0.5 * progress)
+
         best_score = -1e9
         best_next = None
         for j in range(n):
@@ -353,11 +384,16 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
                 continue
             edge_cost = dist_mat[last, j] * (delay_mat[last, j] + pri[j])
             score = sim[j].item() - edge_cost
+            if end_pos is not None:
+                score -= dist_mat[j, end_pos] * end_weight
             if score > best_score:
                 best_score = score
                 best_next = j
         route.append(best_next)
         visited[best_next] = True
+
+    if end_pos is not None:
+        route.append(end_pos)
 
     # Return actual node IDs (not positional indices)
     return [all_nodes[i].id for i in route]
@@ -365,16 +401,18 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
 
 if __name__ == "__main__":
     # Simulate two calls for the same driver (incremental update).
-    # index 0 of every call is the driver's CURRENT LOCATION (never cached).
+    # current_location and end_point are now separate arguments — never
+    # part of `stops`, never cached.
     current_location_call1 = [32.0840, 34.7810, 0, 24, 0]
     initial_stops = [
         [32.0853, 34.7818, 8.0, 12.0, 10],
         [32.0860, 34.7800, 9.0, 13.0, 5],
         [32.0820, 34.7900, 7.0, 11.0, 15],
     ]
-    print("First call (current location + initial stops):")
-    route1 = optimize_route("driver_42", [current_location_call1] + initial_stops)
-    print("Route node IDs:", route1)  # -1 (current location) + 3 cached stop ids
+    end_point = [32.0950, 34.7650, 0, 24, 0]  # mandatory final destination
+    print("First call (current location + initial stops + end point):")
+    route1 = optimize_route("driver_42", current_location_call1, initial_stops, end_point=end_point)
+    print("Route node IDs:", route1)  # -1 (start) ... -2 (end, always last)
     print("Cached node count:", len(load_driver_graph("driver_42").nodes))  # expect 3
 
     # Second call: a slightly-jittered "current location" (simulating GPS
@@ -386,8 +424,8 @@ if __name__ == "__main__":
         [32.0853, 34.7818, 8.0, 12.0, 10],   # duplicate of an existing stop
         [32.0900, 34.7700, 10.0, 14.0, 0],   # genuinely new stop
     ]
-    print("\nSecond call (jittered location + one duplicate + one new stop):")
-    route2 = optimize_route("driver_42", [current_location_call2] + repeat_and_new)
+    print("\nSecond call (jittered location + one duplicate + one new stop + end point):")
+    route2 = optimize_route("driver_42", current_location_call2, repeat_and_new, end_point=end_point)
     print("Route node IDs:", route2)
     print("Cached node count:", len(load_driver_graph("driver_42").nodes))  # expect 4, not 5
 
