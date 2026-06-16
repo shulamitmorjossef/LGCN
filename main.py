@@ -2,6 +2,7 @@ import os
 import json
 import torch
 import numpy as np
+from typing import Optional
 from lgcn.lgcnModel import LGCN
 from lgcn.capsule import squash
 from graph.dynamicGraph import DynamicGraph
@@ -185,11 +186,35 @@ def _distance_matrix(points):
     return np.sqrt(((points[:, None] - points[None, :]) ** 2).sum(axis=2))
 
 
+def _find_matching_node(graph: DynamicGraph, x: float, y: float, tol: float = 1e-6) -> Optional[Node]:
+    """Return an existing node at the same location (x, y), if any.
+
+    Two points are considered "the same point" if their coordinates match
+    within `tol`. Used to avoid caching duplicate stops for a driver.
+    """
+    for node in graph.nodes.values():
+        if abs(node.x - x) <= tol and abs(node.y - y) <= tol:
+            return node
+    return None
+
+
 def _node_to_model_input(node: Node):
     """Returns the 5 features the model expects: [x, y, tw_start, tw_end, wait]."""
     tw_start = node.time_windows[0][0] if node.time_windows else 0.0
     tw_end   = node.time_windows[0][1] if node.time_windows else 0.0
     return [node.x, node.y, tw_start, tw_end, node.wait]
+
+
+def _point_to_node(node_id, pt) -> Node:
+    pt = list(pt)
+    tw = [(pt[2], pt[3])] if len(pt) >= 4 else []
+    wait = pt[4] if len(pt) >= 5 else 0
+    return Node(node_id=node_id, x=pt[0], y=pt[1], time_windows=tw, wait=wait)
+
+
+# Sentinel id for the driver's current location: it is never written to the
+# driver's cache (real cached stop ids are always >= 0), so it can't collide.
+_CURRENT_LOCATION_ID = -1
 
 
 # ── Main routing function ─────────────────────────────────────────────────────
@@ -199,41 +224,79 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
     Incrementally update a driver's graph and return the optimal route over
     all their current stops.
 
+    By convention, `new_points[0]` is always the driver's CURRENT LOCATION,
+    not a stop: it's only used as the route's starting point for this call
+    and is never written to the driver's cache. GPS readings for "the same"
+    physical spot jitter by a few meters between requests, so caching it
+    would create a new spurious stop on every refresh. `new_points[1:]` are
+    the actual stops — each one is checked against the driver's cached
+    stops by coordinates: if it already exists it is NOT added again (no
+    duplicate node), but it is still taken into account when computing the
+    route. Only genuinely new stops are added to the cache.
+
     Args:
         driver_id:      Unique identifier for the driver.
-        new_points:     List of NEW stops as [x, y, tw_start, tw_end, wait].
-                        Pass all stops on the first call; only new ones on updates.
-        traffic_delays: Optional N×N matrix (for the NEW points only, relative
-                        to each other). Not stored on existing edges.
-        priorities:     Optional priority per NEW stop.
+        new_points:     [current_location, *stops], each as
+                        [x, y, tw_start, tw_end, wait]. Pass all stops on
+                        the first call; on later calls you may pass the
+                        full current set again — stops that already exist
+                        for this driver are recognized and skipped, only
+                        genuinely new ones get cached. The current location
+                        (index 0) is refreshed every call regardless.
+        traffic_delays: Optional N×N matrix (for the points in `new_points`,
+                        relative to each other, in that order).
+        priorities:     Optional priority per point in `new_points` (same
+                        order/length as `new_points`).
 
     Returns:
-        list: Ordered node-id values representing the optimal route over ALL
-              current stops for this driver.
+        list: Ordered node-id values representing the optimal route over the
+              current location and ALL current stops for this driver. The
+              current location is reported with id `-1` since it isn't a
+              cached node.
     """
-    # Load existing graph state for this driver
+    if not new_points:
+        raise ValueError("new_points must include at least the current location")
+
+    current_pt, stop_points = new_points[0], new_points[1:]
+
+    # Load existing graph state for this driver (cached STOPS only — the
+    # current location is never persisted here).
     graph = load_driver_graph(driver_id)
     existing_ids = list(graph.nodes.keys())
-
-    # Add new nodes (incremental graph update per LGCN paper §II-A)
     next_id = max(existing_ids, default=-1) + 1
-    new_node_ids = []
-    for i, pt in enumerate(new_points):
-        pt = list(pt)
-        tw = [(pt[2], pt[3])] if len(pt) >= 4 else []
-        wait = pt[4] if len(pt) >= 5 else 0
-        node = Node(node_id=next_id + i, x=pt[0], y=pt[1], time_windows=tw, wait=wait)
+
+    # For each incoming stop, resolve it to a node id: reuse the existing
+    # node if this stop is already cached for the driver, otherwise create
+    # and cache a new node. `request_node_ids` keeps the same order/length
+    # as `new_points` (index 0 = current location sentinel) so
+    # traffic_delays/priorities can be mapped back.
+    request_node_ids = [_CURRENT_LOCATION_ID]
+    graph_changed = False
+    for pt in stop_points:
+        match = _find_matching_node(graph, pt[0], pt[1])
+        if match is not None:
+            request_node_ids.append(match.id)
+            continue
+        node = _point_to_node(next_id, pt)
         graph.add_node(node)
-        new_node_ids.append(node.id)
+        request_node_ids.append(node.id)
+        next_id += 1
+        graph_changed = True
 
-    # Persist updated graph
-    save_driver_graph(driver_id, graph)
+    # Persist updated graph only if a genuinely new stop was actually added
+    if graph_changed:
+        save_driver_graph(driver_id, graph)
 
-    all_nodes = list(graph.nodes.values())
+    # Current location is transient: built fresh every call, used as the
+    # route's starting point, but never added to `graph`/the cache.
+    current_node = _point_to_node(_CURRENT_LOCATION_ID, current_pt)
+    all_nodes = [current_node] + list(graph.nodes.values())
     n = len(all_nodes)
 
     if n <= 1:
         return [node.id for node in all_nodes]
+
+    id_to_pos = {node.id: idx for idx, node in enumerate(all_nodes)}
 
     # Build model input features for all current nodes
     points_arr = np.array([_node_to_model_input(node) for node in all_nodes], dtype=np.float32)
@@ -250,23 +313,31 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
 
     dist_mat = _distance_matrix(points_arr[:, :2])
 
-    # Build traffic/priority arrays aligned to current node order
-    if priorities is None:
-        pri = np.ones(n, dtype=np.float64)
-    else:
-        # priorities apply only to new nodes; existing nodes default to 1
-        pri = np.ones(n, dtype=np.float64)
-        for local_i, nid in enumerate(new_node_ids):
-            pos = next((idx for idx, nd in enumerate(all_nodes) if nd.id == nid), None)
-            if pos is not None and local_i < len(priorities):
+    # Build traffic/priority arrays aligned to current node order.
+    # `request_node_ids[local_i]` is the node id that `new_points[local_i]`
+    # resolved to (a new node, or a pre-existing/duplicate one) — used to
+    # map the request-ordered priorities/traffic_delays onto graph positions.
+    pri = np.ones(n, dtype=np.float64)
+    if priorities is not None:
+        for local_i, nid in enumerate(request_node_ids):
+            if local_i >= len(priorities):
+                break
+            pos = id_to_pos.get(nid)
+            if pos is not None:
                 pri[pos] = priorities[local_i]
 
     delay_mat = np.zeros((n, n), dtype=np.float64)
     if traffic_delays is not None:
         td = np.array(traffic_delays, dtype=np.float64)
-        offset = len(existing_ids)
-        size = min(td.shape[0], n - offset)
-        delay_mat[offset:offset + size, offset:offset + size] = td[:size, :size]
+        size = min(td.shape[0], len(request_node_ids))
+        for a in range(size):
+            pos_a = id_to_pos.get(request_node_ids[a])
+            if pos_a is None:
+                continue
+            for b in range(size):
+                pos_b = id_to_pos.get(request_node_ids[b])
+                if pos_b is not None:
+                    delay_mat[pos_a, pos_b] = td[a, b]
 
     # Greedy route construction (score = capsule similarity − edge cost)
     visited = [False] * n
@@ -293,20 +364,32 @@ def optimize_route(driver_id: str, new_points, traffic_delays=None, priorities=N
 
 
 if __name__ == "__main__":
-    # Simulate two calls for the same driver (incremental update)
+    # Simulate two calls for the same driver (incremental update).
+    # index 0 of every call is the driver's CURRENT LOCATION (never cached).
+    current_location_call1 = [32.0840, 34.7810, 0, 24, 0]
     initial_stops = [
         [32.0853, 34.7818, 8.0, 12.0, 10],
         [32.0860, 34.7800, 9.0, 13.0, 5],
         [32.0820, 34.7900, 7.0, 11.0, 15],
     ]
-    print("First call (initial stops):")
-    route1 = optimize_route("driver_42", initial_stops)
-    print("Route node IDs:", route1)
+    print("First call (current location + initial stops):")
+    route1 = optimize_route("driver_42", [current_location_call1] + initial_stops)
+    print("Route node IDs:", route1)  # -1 (current location) + 3 cached stop ids
+    print("Cached node count:", len(load_driver_graph("driver_42").nodes))  # expect 3
 
-    new_stop = [[32.0900, 34.7700, 10.0, 14.0, 0]]
-    print("\nSecond call (one new stop added):")
-    route2 = optimize_route("driver_42", new_stop)
+    # Second call: a slightly-jittered "current location" (simulating GPS
+    # noise) + one stop that's already cached + one genuinely new stop.
+    # The jittered current location must NOT pollute the cache, the
+    # duplicate stop must NOT be re-added, only the new stop gets cached.
+    current_location_call2 = [32.0840031, 34.7809972, 0, 24, 0]  # GPS jitter
+    repeat_and_new = [
+        [32.0853, 34.7818, 8.0, 12.0, 10],   # duplicate of an existing stop
+        [32.0900, 34.7700, 10.0, 14.0, 0],   # genuinely new stop
+    ]
+    print("\nSecond call (jittered location + one duplicate + one new stop):")
+    route2 = optimize_route("driver_42", [current_location_call2] + repeat_and_new)
     print("Route node IDs:", route2)
+    print("Cached node count:", len(load_driver_graph("driver_42").nodes))  # expect 4, not 5
 
     # Clean up test state
     reset_driver("driver_42")
