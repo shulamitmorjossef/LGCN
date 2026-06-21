@@ -9,22 +9,22 @@ from graph.dynamicGraph import DynamicGraph
 from graph.node import Node
 from graph.edge import Edge
 
-# ─── מטריצות קבועות ───────────────────────────────────────────────────────────
+# ─── Fixed matrices ───────────────────────────────────────────────────────────
 # features: [lat, lon, tw_start, tw_end, wait_time]
-# סקאלות: lat~32, lon~35, tw~8-18 (שעות), wait~0-20 (דקות)
+# Scales: lat~32, lon~35, tw~8-18 (hours), wait~0-20 (minutes)
 
 # W1 [8×5]: features → node capsule
-# כל שורה מייצרת ממד אחד בקפסולה.
-# - שורות 0-1: נרמול lat/lon לטווח ~[0,1] (×0.03)
-# - שורה 2:  מרכז חלון הזמן = (tw_s+tw_e)/2, קנה-מידה ×0.06 → ערך ~0.6-1.0
-# - שורה 3:  רוחב החלון = tw_s - tw_e (תמיד שלילי).
-#            חלון צר (2שע) → -0.3  /  חלון רחב (10שע) → -1.5
-#            כלומר: דחוף = קרוב ל-0, גמיש = שלילי-גדול
-# - שורה 4:  -tw_end × 0.08: deadline מוקדם (11) → -0.88, מאוחר (18) → -1.44
-#            כלומר: deadline מוקדם = ערך פחות שלילי = גבוה יותר
-# - שורה 5:  tw_start × 0.10: מתי מותר להגיע לכל היותר מוקדם
-# - שורה 6:  -wait × 0.05: המתנה=0→0, המתנה=20→-1.0  (פחות המתנה = ערך גבוה יותר)
-# - שורה 7:  ניקוד דחיפות משולב: lat+lon קטנים + חלון צר + deadline מוקדם + wait נמוך
+# Each row produces one dimension in the capsule.
+# - Rows 0-1: normalize lat/lon to range ~[0,1] (×0.03)
+# - Row 2:  time window center = (tw_s+tw_e)/2, scale ×0.06 → value ~0.6-1.0
+# - Row 3:  window width = tw_s - tw_e (always negative).
+#            narrow window (2h) → -0.3  /  wide window (10h) → -1.5
+#            i.e.: urgent = close to 0, flexible = large-negative
+# - Row 4:  -tw_end × 0.08: early deadline (11) → -0.88, late (18) → -1.44
+#            i.e.: early deadline = less negative value = higher
+# - Row 5:  tw_start × 0.10: earliest allowed arrival time
+# - Row 6:  -wait × 0.05: wait=0→0, wait=20→-1.0  (less waiting = higher value)
+# - Row 7:  combined urgency score: small lat+lon + narrow window + early deadline + low wait
 _W1 = np.array([
     [ 0.03,  0.00,  0.00,  0.00,  0.00],
     [ 0.00,  0.03,  0.00,  0.00,  0.00],
@@ -36,15 +36,15 @@ _W1 = np.array([
     [ 0.01,  0.01,  0.08, -0.08, -0.04],
 ], dtype=np.float32)
 
-# W2 [4×8]: node capsule → prediction vector לתת-מסלול (dynamic routing)
-# תחנות עם ממדים דומים יצביעו בכיוון דומה → יקובצו יחד.
-# - שורה 0: קלאסטר גיאוגרפי — משקל גבוה על dim0(lat) ו-dim1(lon)
-#           תחנות קרובות מרחקית = הצבעות קרובות = יכנסו לאותו תת-מסלול
-# - שורה 1: קלאסטר זמן — מרכז חלון (dim2) + deadline (dim4)
-#           תחנות עם חלון זמן דומה = יתכנסו יחד
-# - שורה 2: קלאסטר דחיפות — רוחב חלון (dim3) + deadline (dim4) + wait (dim6)
-#           תחנות דחופות = הצבעות דומות = ייכנסו לתת-מסלול "דחוף"
-# - שורה 3: יעילות כוללת — שילוב כל הממדים, משקל מיוחד ל-dim7 (ניקוד משולב)
+# W2 [4×8]: node capsule → prediction vector for sub-route (dynamic routing)
+# Stops with similar dimensions vote in the same direction → they get grouped together.
+# - Row 0: geographic cluster — high weight on dim0(lat) and dim1(lon)
+#           geographically close stops = close votes = enter the same sub-route
+# - Row 1: time cluster — window center (dim2) + deadline (dim4)
+#           stops with similar time window converge together
+# - Row 2: urgency cluster — window width (dim3) + deadline (dim4) + wait (dim6)
+#           urgent stops = similar votes = enter the "urgent" sub-route
+# - Row 3: overall efficiency — combination of all dimensions, special weight for dim7 (combined score)
 _W2 = np.array([
     [ 0.90,  0.90,  0.00,  0.00,  0.00,  0.00,  0.00,  0.10],
     [ 0.00,  0.00,  0.85,  0.00,  0.85,  0.00,  0.00,  0.10],
@@ -52,11 +52,11 @@ _W2 = np.array([
     [ 0.25,  0.25,  0.25,  0.10,  0.10,  0.25,  0.20,  0.40],
 ], dtype=np.float32)
 
-# W3 [4×4]: subroute capsule → prediction vector למסלול שלם
-# עם num_subroutes=1 זהו מעבר יחיד (אין הסכמה). המטריצה מבצעת:
-# - שורות 0-1: מיזוג קל בין ממד גיאוגרפי לממד זמן (10% cross-mix)
-#   → הקפסולה הסופית מודעת לשני הממדים, לא רק לאחד
-# - שורות 2-3: אותו רעיון לממדי דחיפות ויעילות
+# W3 [4×4]: subroute capsule → prediction vector for full route
+# With num_subroutes=1 this is a single pass (no consensus). The matrix performs:
+# - Rows 0-1: light blending between geographic and time dimensions (10% cross-mix)
+#   → the final capsule is aware of both dimensions, not just one
+# - Rows 2-3: same idea for urgency and efficiency dimensions
 _W3 = np.array([
     [ 0.90,  0.10,  0.00,  0.00],
     [ 0.10,  0.90,  0.00,  0.00],
@@ -64,20 +64,20 @@ _W3 = np.array([
     [ 0.00,  0.00,  0.15,  0.85],
 ], dtype=np.float32)
 
-# W4 [4×8]: node capsule → הטלה למרחב full_route_caps (לחישוב sim)
-# sim[j] = dot(W4 × c_j, full_route_caps) — ציון כמה תחנה j "שייכת" למסלול
+# W4 [4×8]: node capsule → projection to full_route_caps space (for sim calculation)
+# sim[j] = dot(W4 × c_j, full_route_caps) — score of how much stop j "belongs" to the route
 #
-# הלוגיקה: dim3/dim4/dim6 של הקפסולה שליליים.
-# תחנה דחופה = ערכים שליליים קרובים ל-0.
-# W4 עם משקלים חיוביים על dim3,dim4,dim6 →
-#   דחוף: W4×(-0.3) = -0.24  /  גמיש: W4×(-1.5) = -1.2
-#   full_route_caps[2] (ממד דחיפות) גם שלילי →
-#   dot: (-0.24)×(שלילי) > (-1.2)×(שלילי)  → תחנה דחופה מקבלת sim גבוה יותר ✓
+# Logic: dim3/dim4/dim6 of the capsule are negative.
+# An urgent stop = negative values close to 0.
+# W4 with positive weights on dim3,dim4,dim6 →
+#   urgent: W4×(-0.3) = -0.24  /  flexible: W4×(-1.5) = -1.2
+#   full_route_caps[2] (urgency dimension) is also negative →
+#   dot: (-0.24)×(negative) > (-1.2)×(negative)  → urgent stop receives higher sim ✓
 #
-# - שורה 0: ממד גיאוגרפי → מיפוי lat/lon לאותו ממד כמו W2/W3
-# - שורה 1: ממד זמן → מרכז חלון + deadline
-# - שורה 2: ממד דחיפות → רוחב חלון + deadline + wait (החשוב ביותר לניקוד)
-# - שורה 3: ממד משולב → weighted combination של הכל
+# - Row 0: geographic dimension → maps lat/lon to same dimension as W2/W3
+# - Row 1: time dimension → window center + deadline
+# - Row 2: urgency dimension → window width + deadline + wait (most important for scoring)
+# - Row 3: combined dimension → weighted combination of everything
 _W4 = np.array([
     [ 0.80,  0.80,  0.00,  0.00,  0.00,  0.00,  0.00,  0.20],
     [ 0.00,  0.00,  0.80,  0.00,  0.70,  0.50,  0.00,  0.20],
