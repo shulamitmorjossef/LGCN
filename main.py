@@ -180,6 +180,16 @@ def reset_driver(driver_id: str) -> None:
         os.remove(path)
 
 
+def remove_driver_stop(driver_id: str, x: float, y: float) -> bool:
+    graph = load_driver_graph(driver_id)
+    node = _find_matching_node(graph, x, y)
+    if node is None:
+        return False
+    graph.remove_node(node.id)
+    save_driver_graph(driver_id, graph)
+    return True
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _distance_matrix(points):
